@@ -417,3 +417,337 @@ def test_delay_endpoint_survives_and_rounds_still_exact(cluster, tmp_path):
     ref = httpx.get(base + "/api/reference", timeout=10).json()
     for k, point in enumerate(st["loss_history"]):
         assert point["loss"] == ref["loss"][k]
+
+
+# ----------------------------------------------------- record withdrawal tests
+def _pause_group(base):
+    """Pause a running group, tolerating the between-rounds race."""
+    deadline = time.time() + 20
+    while True:
+        r = httpx.post(base + "/api/pause", timeout=5)
+        if r.status_code == 200:
+            return
+        st = httpx.get(base + "/api/status", timeout=5).json()["status"]
+        if st == "completed":
+            raise AssertionError("training completed before pause took effect")
+        assert time.time() < deadline, f"could not pause; status={st}"
+        time.sleep(0.3)
+
+
+def test_withdraw_rejected_while_running(cluster, tmp_path):
+    base = cluster["coord"]
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0.3}, timeout=5)
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=10)
+    # The page only offers withdrawal while paused/completed; the API agrees.
+    r = httpx.post(base + "/api/withdraw", json={"row": 1}, timeout=5)
+    assert r.status_code == 409
+    st = _wait_status(base, lambda d: d["status"] == "completed", timeout=60)
+    assert st["confirmed_round"] == 10
+    assert "withdrawal" not in st
+
+
+def test_withdraw_validation_rejects_and_task_stays_usable(cluster, tmp_path):
+    base = cluster["coord"]
+    p = tmp_path / "four.csv"
+    p.write_text("x1,x2,label\n0,0,0\n1,1,1\n2,2,1\n3,3,0\n")
+    _create_and_start(base, p, rounds=6)
+    st = _wait_status(base, lambda d: d["status"] == "completed")
+    old_task = st["task_id"]
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 200
+
+    # Out-of-range row numbers are rejected (1-based data rows).
+    assert httpx.post(base + "/api/withdraw", json={"row": 5},
+                      timeout=5).status_code == 400
+    assert httpx.post(base + "/api/withdraw", json={"row": 0},
+                      timeout=5).status_code in (400, 422)
+    # The original task is untouched and fully usable.
+    st = httpx.get(base + "/api/status", timeout=5).json()
+    assert st["task_id"] == old_task and st["status"] == "completed"
+    assert st["confirmed_round"] == 6
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 200
+
+    # Withdrawal that would leave a single label class -> rejected.
+    (tmp_path / "three.csv").write_text("x1,x2,label\n0,0,0\n1,1,1\n2,2,1\n")
+    httpx.post(base + "/api/reset", timeout=5)
+    with open(tmp_path / "three.csv", "rb") as f:
+        httpx.post(base + "/api/job?rounds=4",
+                   files={"file": ("t.csv", f, "text/csv")},
+                   timeout=15).raise_for_status()
+    httpx.post(base + "/api/start", timeout=10)
+    _wait_status(base, lambda d: d["status"] == "completed")
+    r = httpx.post(base + "/api/withdraw", json={"row": 1}, timeout=5)
+    assert r.status_code == 400 and "single label" in r.text
+    st = httpx.get(base + "/api/status", timeout=5).json()
+    assert st["status"] == "completed" and st["confirmed_round"] == 4
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 200
+
+    # Withdrawal that would leave fewer than two rows -> rejected.
+    (tmp_path / "two.csv").write_text("x1,x2,label\n0,0,0\n1,1,1\n")
+    httpx.post(base + "/api/reset", timeout=5)
+    with open(tmp_path / "two.csv", "rb") as f:
+        httpx.post(base + "/api/job?rounds=2",
+                   files={"file": ("t2.csv", f, "text/csv")},
+                   timeout=15).raise_for_status()
+    httpx.post(base + "/api/start", timeout=10)
+    _wait_status(base, lambda d: d["status"] == "completed")
+    r = httpx.post(base + "/api/withdraw", json={"row": 1}, timeout=5)
+    assert r.status_code == 400 and "fewer than 2" in r.text
+    st = httpx.get(base + "/api/status", timeout=5).json()
+    assert st["status"] == "completed" and st["confirmed_round"] == 2
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 200
+
+
+def test_withdraw_completed_task_retrains_from_zero(cluster, tmp_path):
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path, n=12), rounds=8)
+    st = _wait_status(base, lambda d: d["status"] == "completed")
+    old_task = st["task_id"]
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 200
+
+    # Withdraw data row 3 (1-based): accepted, task rebuilt from zero.
+    r = httpx.post(base + "/api/withdraw", json={"row": 3}, timeout=10)
+    assert r.status_code == 200, r.text
+    st = r.json()
+    assert st["status"] == "idle"
+    assert st["withdrawal"]["state"] == "applied"
+    assert st["withdrawal"]["row"] == 3
+    assert st["task_id"] != old_task
+    assert st["confirmed_round"] == 0 and st["gen"] == 0
+    assert [p["round"] for p in st["loss_history"]] == [0]
+    assert st["total_rounds"] == 8
+
+    # Old weights are revoked immediately and irrevocably (files gone).
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 409
+    assert not list((cluster["paths"]["coord"] / "weights")
+                    .glob("weights_*.json"))
+
+    # Both workers hold only the revised shard of the NEW task.
+    for w in ("w1", "w2"):
+        h = httpx.get(f"http://127.0.0.1:{cluster[w].port}/health",
+                      timeout=5).json()
+        assert h["task_id"] == st["task_id"] and h["round"] == 0
+    # Old training messages cannot advance the new task.
+    r = httpx.post(f"http://127.0.0.1:{cluster['w1'].port}/gradient",
+                   json={"task_id": old_task, "gen": 9, "round": 1}, timeout=5)
+    assert r.status_code == 410
+
+    # Retrain from zero; the download stays locked until completion.
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0.3}, timeout=5)
+    httpx.post(base + "/api/start", timeout=10).raise_for_status()
+    _wait_status(base, lambda d: d["confirmed_round"] >= 3)
+    _pause_group(base)
+    st = _wait_status(base, lambda d: d["status"] == "paused")
+    assert 0 < st["confirmed_round"] < 8
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 409
+    assert httpx.get(base + "/api/status",
+                     timeout=5).json()["weights_available"] is False
+
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0}, timeout=5)
+    httpx.post(base + "/api/resume", timeout=15).raise_for_status()
+    st = _wait_status(base, lambda d: d["status"] == "completed", timeout=60)
+
+    # Bit-exact against the single-process reference over the revised data.
+    ref = httpx.get(base + "/api/reference", timeout=10).json()
+    assert [p["round"] for p in st["loss_history"]] == list(range(9))
+    for k, point in enumerate(st["loss_history"]):
+        assert point["loss"] == ref["loss"][k]
+    np.testing.assert_array_equal(np.asarray(st["w"]),
+                                  np.asarray(ref["weights"][-1]))
+    wdoc = httpx.get(base + "/api/weights", timeout=5).json()
+    assert wdoc["confirmed_round"] == 8
+    assert wdoc["weights"]["w1"] == st["w"][1]
+
+
+def test_withdraw_pending_when_worker_down_then_retry(cluster, tmp_path):
+    base = cluster["coord"]
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0.3}, timeout=5)
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=10)
+    st = _wait_status(base, lambda d: d["confirmed_round"] >= 3)
+    old_task = st["task_id"]
+    _pause_group(base)
+    _wait_status(base, lambda d: d["status"] == "paused")
+
+    # One side is unreachable: the withdrawal is accepted but stays pending.
+    cluster["w2"].hard_kill()
+    r = httpx.post(base + "/api/withdraw", json={"row": 2}, timeout=10)
+    assert r.status_code == 202, r.text
+    st = r.json()
+    assert st["status"] == "withdrawing"
+    assert st["withdrawal"]["state"] == "pending"
+    assert st["withdrawal"]["row"] == 2
+    new_task = st["task_id"]
+    assert new_task != old_task
+
+    # While pending: old weights revoked, group cannot start, no old model.
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 409
+    assert httpx.get(base + "/api/status",
+                     timeout=5).json()["weights_available"] is False
+    assert httpx.post(base + "/api/start", timeout=5).status_code == 409
+    assert not list((cluster["paths"]["coord"] / "weights")
+                    .glob("weights_*.json"))
+
+    # A different row conflicts; the same row is an idempotent retry.
+    assert httpx.post(base + "/api/withdraw", json={"row": 5},
+                      timeout=5).status_code == 409
+    assert httpx.post(base + "/api/withdraw", json={"row": 2},
+                      timeout=10).status_code == 202
+
+    # worker1 already holds the revised shard; the dead worker2 never got it,
+    # so no mixture of old/new shards can be trained on.
+    h1 = httpx.get(f"http://127.0.0.1:{cluster['w1'].port}/health",
+                   timeout=5).json()
+    assert h1["task_id"] == new_task and h1["round"] == 0
+
+    # Revive worker2 and retry the same withdrawal: it completes.
+    cluster["w2"].start()
+    r = httpx.post(base + "/api/withdraw", json={"row": 2}, timeout=10)
+    assert r.status_code == 200, r.text
+    st = r.json()
+    assert st["status"] == "idle" and st["withdrawal"]["state"] == "applied"
+    h2 = httpx.get(f"http://127.0.0.1:{cluster['w2'].port}/health",
+                   timeout=5).json()
+    assert h2["task_id"] == new_task and h2["round"] == 0
+
+    # Old-task traffic is fenced on both workers.
+    for w in ("w1", "w2"):
+        rr = httpx.post(f"http://127.0.0.1:{cluster[w].port}/gradient",
+                        json={"task_id": old_task, "gen": 9, "round": 1},
+                        timeout=5)
+        assert rr.status_code == 410
+
+    # Train the revised task to completion: exact vs the revised reference.
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0}, timeout=5)
+    httpx.post(base + "/api/start", timeout=10).raise_for_status()
+    st = _wait_status(base, lambda d: d["status"] == "completed", timeout=60)
+    ref = httpx.get(base + "/api/reference", timeout=10).json()
+    assert [p["round"] for p in st["loss_history"]] == list(range(11))
+    for k, point in enumerate(st["loss_history"]):
+        assert point["loss"] == ref["loss"][k]
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 200
+
+
+def test_withdraw_pending_survives_coordinator_restart(cluster, tmp_path):
+    base = cluster["coord"]
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0.3}, timeout=5)
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=8)
+    _wait_status(base, lambda d: d["confirmed_round"] >= 2)
+    _pause_group(base)
+    _wait_status(base, lambda d: d["status"] == "paused")
+
+    cluster["w2"].hard_kill()
+    r = httpx.post(base + "/api/withdraw", json={"row": 4}, timeout=10)
+    assert r.status_code == 202
+    assert r.json()["withdrawal"]["state"] == "pending"
+
+    # Coordinator restarts while the withdrawal is pending.
+    cluster["coord_svc"].hard_kill()
+    cluster["coord_svc"].start()
+
+    st = httpx.get(base + "/api/status", timeout=10).json()
+    assert st["status"] == "withdrawing"
+    assert st["withdrawal"]["state"] == "pending"
+    assert st["withdrawal"]["row"] == 4
+    assert st["weights_available"] is False
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 409
+    assert httpx.post(base + "/api/start", timeout=5).status_code == 409
+    # The old model cannot be restored: artifacts are gone from disk.
+    assert not list((cluster["paths"]["coord"] / "weights")
+                    .glob("weights_*.json"))
+
+    # Revive the missing side and retry the same withdrawal (no CSV needed).
+    cluster["w2"].start()
+    r = httpx.post(base + "/api/withdraw", json={"row": 4}, timeout=10)
+    assert r.status_code == 200, r.text
+    st = r.json()
+    assert st["status"] == "idle" and st["withdrawal"]["state"] == "applied"
+
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0}, timeout=5)
+    httpx.post(base + "/api/start", timeout=10).raise_for_status()
+    st = _wait_status(base, lambda d: d["status"] == "completed", timeout=60)
+    ref = httpx.get(base + "/api/reference", timeout=10).json()
+    for k, point in enumerate(st["loss_history"]):
+        assert point["loss"] == ref["loss"][k]
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 200
+
+
+def test_withdraw_crash_between_job_and_status_write_recovers(cluster, tmp_path):
+    """Crash window inside acceptance: job.json already revised (new task id,
+    withdrawn row recorded) while status.json is still the old task and the
+    old weight artifacts still exist. Startup must reconcile to a pending
+    withdrawal, purge the old model, and finish the redistribution."""
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=6)
+    st = _wait_status(base, lambda d: d["status"] == "completed")
+    old_task = st["task_id"]
+    cdir = cluster["paths"]["coord"]
+
+    cluster["coord_svc"].hard_kill()
+    job = json.loads((cdir / "job.json").read_text())
+    revised = {**job, "task_id": "taskB", "withdrawn_row": 2,
+               "previous_task_id": old_task,
+               "x": job["x"][:1] + job["x"][2:],
+               "y": job["y"][:1] + job["y"][2:]}
+    revised["n"] = len(revised["y"])
+    cut = (revised["n"] + 1) // 2
+    revised["shards"] = {"worker1": list(range(cut)),
+                         "worker2": list(range(cut, revised["n"]))}
+    (cdir / "job.json").write_text(json.dumps(revised))
+    # status.json untouched (old task); old weights still on disk.
+    assert (cdir / "weights" / "weights_latest.json").exists()
+    cluster["coord_svc"].start()
+
+    st = httpx.get(base + "/api/status", timeout=10).json()
+    assert st["task_id"] == "taskB"
+    assert st["withdrawal"]["row"] == 2
+    # Both workers were reachable, so recovery finished the redistribution.
+    assert st["status"] == "idle"
+    assert st["withdrawal"]["state"] == "applied"
+    # The old model was purged during recovery and cannot be downloaded.
+    assert not list((cdir / "weights").glob("weights_*.json"))
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 409
+    for w in ("w1", "w2"):
+        h = httpx.get(f"http://127.0.0.1:{cluster[w].port}/health",
+                      timeout=5).json()
+        assert h["task_id"] == "taskB" and h["round"] == 0
+
+    # The recovered task trains from zero, exactly like a clean withdrawal.
+    httpx.post(base + "/api/start", timeout=10).raise_for_status()
+    st = _wait_status(base, lambda d: d["status"] == "completed", timeout=60)
+    ref = httpx.get(base + "/api/reference", timeout=10).json()
+    for k, point in enumerate(st["loss_history"]):
+        assert point["loss"] == ref["loss"][k]
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 200
+
+
+def test_worker_interrupted_load_never_mixes_shard_and_model(cluster, tmp_path):
+    """A worker killed between writing a new shard and its matching state
+    (e.g. mid-withdrawal) restarts with the new shard at round 0 - never the
+    new shard combined with the old task's model."""
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=6)
+    st = _wait_status(base, lambda d: d["status"] == "completed")
+    old_task = st["task_id"]
+
+    # Simulate an interrupted /load on worker1: shard.json already belongs to
+    # the revised task B while state.json is still task A at round 6.
+    w1dir = cluster["paths"]["w1"]
+    shard = json.loads((w1dir / "shard.json").read_text())
+    state = json.loads((w1dir / "state.json").read_text())
+    assert state["task_id"] == old_task and state["round"] == 6
+    cluster["w1"].hard_kill()
+    shard["task_id"] = "taskB"
+    shard["rows"] = shard["rows"][:-1]  # revised (smaller) shard
+    (w1dir / "shard.json").write_text(json.dumps(shard))
+    cluster["w1"].start()
+
+    # Reconciled to the new shard's task, training state reset to zero, and
+    # the reconciliation itself is durable.
+    h = httpx.get(f"http://127.0.0.1:{cluster['w1'].port}/health",
+                  timeout=5).json()
+    assert h["task_id"] == "taskB" and h["round"] == 0
+    disk = json.loads((w1dir / "state.json").read_text())
+    assert disk["task_id"] == "taskB" and disk["round"] == 0
+    # Old-task traffic is fenced.
+    r = httpx.post(f"http://127.0.0.1:{cluster['w1'].port}/gradient",
+                   json={"task_id": old_task, "gen": 3, "round": 7}, timeout=5)
+    assert r.status_code == 410

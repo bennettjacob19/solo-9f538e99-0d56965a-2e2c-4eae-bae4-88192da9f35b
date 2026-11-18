@@ -66,11 +66,24 @@ class WorkerState:
             self._install_shard(shard["rows"])
         state = if_exists_read_json(STATE_PATH)
         if state:
-            # A persisted state always belongs to the shard's task.
-            self.task_id = state["task_id"]
-            self.round = int(state["round"])
-            self.w = np.asarray(state["w"], dtype=np.float64)
-            self.v = np.asarray(state["v"], dtype=np.float64)
+            if shard is None or state.get("task_id") == self.task_id:
+                # A persisted state always belongs to the shard's task.
+                self.task_id = state["task_id"]
+                self.round = int(state["round"])
+                self.w = np.asarray(state["w"], dtype=np.float64)
+                self.v = np.asarray(state["v"], dtype=np.float64)
+            else:
+                # A /load (e.g. a record withdrawal) was interrupted after the
+                # new shard was written but before the matching state: never
+                # mix the new shard with the old task's model. Restart the
+                # shard's task from zero and make the reconciliation durable.
+                self.round = 0
+                self.w = lrmath.zero_buffers()
+                self.v = lrmath.zero_buffers()
+                atomic_write_json(STATE_PATH, {
+                    "task_id": self.task_id, "gen": None, "round": 0,
+                    "w": lrmath.to_list(self.w), "v": lrmath.to_list(self.v),
+                })
         # gen intentionally stays None: a restarted worker must be re-prepared.
 
     def _install_shard(self, rows: list) -> None:

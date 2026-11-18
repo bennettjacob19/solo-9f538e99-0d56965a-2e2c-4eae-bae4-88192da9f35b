@@ -61,6 +61,24 @@ def exists(path: str) -> bool:
     return os.path.exists(path)
 
 
+def delete_files(directory: str, predicate) -> None:
+    """Delete every matching file in ``directory`` and fsync the directory.
+
+    Used to revoke published artifacts (e.g. weight files) so that a crash
+    or container restart cannot bring the deleted files back: the directory
+    fsync makes the removals durable, mirroring the atomic-write protocol.
+    """
+    if not os.path.isdir(directory):
+        return
+    for name in os.listdir(directory):
+        if predicate(name):
+            try:
+                os.unlink(os.path.join(directory, name))
+            except FileNotFoundError:
+                pass
+    _fsync_dir(directory)
+
+
 def if_exists_read_json(path: str) -> Any | None:
     if not os.path.exists(path):
         return None

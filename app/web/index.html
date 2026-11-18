@@ -37,7 +37,7 @@
   .pill { display:inline-block; padding:2px 10px; border-radius:999px;
           font-size:12px; font-weight:600; }
   .pill.running { background:#1d3a5f; color:#9cc2ff; }
-  .pill.paused,.pill.preparing { background:#4a3a12; color:var(--warn); }
+  .pill.paused,.pill.preparing,.pill.withdrawing { background:#4a3a12; color:var(--warn); }
   .pill.completed { background:#13402d; color:var(--ok); }
   .pill.idle { background:#2a3550; color:var(--muted); }
   .dot { display:inline-block; width:9px; height:9px; border-radius:50%;
@@ -99,7 +99,23 @@
     </div>
 
     <div class="card" style="margin-top:18px">
-      <h2>3 · 故障注入</h2>
+      <h2>3 · 撤回作废记录（按原 CSV 数据行号）</h2>
+      <label>数据行号（1 起，不含表头；仅任务暂停或完成时可受理）</label>
+      <div class="row">
+        <input type="number" id="wdRow" min="1" step="1" value="1" style="flex:1">
+        <button class="warn" id="btnWithdraw">撤回该行并重新训练</button>
+      </div>
+      <div class="row">
+        <button class="ghost" id="btnWithdrawRetry" style="display:none">重试同一次撤回</button>
+      </div>
+      <div class="err" id="withdrawErr"></div>
+      <div class="hint">受理后旧权重立即不可下载且不可恢复；修订样本重新互斥分片给两个
+        worker（新任务号，旧训练消息一律被拒），训练从零开始，完成后才能下载新权重。
+        一侧失联时撤回保持待完成，可直接重试，无需重传 CSV。</div>
+    </div>
+
+    <div class="card" style="margin-top:18px">
+      <h2>4 · 故障注入</h2>
       <label>人工延迟（秒，注入到每个进程的梯度/提交/准备响应）</label>
       <div class="row">
         <input type="number" id="delay" value="0" min="0" max="120" step="0.5"
@@ -123,6 +139,8 @@
         <div class="k">已确认轮次</div><div id="confirmed">—</div>
         <div class="k">最新损失（全数据 BCE）</div><div id="loss">—</div>
         <div class="k">进行中轮次</div><div id="running">—</div>
+        <div class="k">撤回记录</div><div id="withdrawal">—</div>
+        <div class="k">权重可下载</div><div id="wavail">—</div>
         <div class="k">最近事件</div><div id="event">—</div>
         <div class="k">错误</div><div class="err" id="err" style="margin:0"></div>
       </div>
@@ -157,7 +175,7 @@
 
 <script>
 const $ = id => document.getElementById(id);
-let lastEvent = "", pollTimer = null;
+let lastEvent = "", pollTimer = null, lastStatus = {};
 
 async function api(path, opts={}) {
   const r = await fetch(path, opts);
@@ -237,6 +255,7 @@ function drawChart(history) {
 }
 
 function render(d) {
+  lastStatus = d;
   const st = d.status || "idle";
   const el = $("st"); el.textContent = st; el.className = "pill "+st;
   $("gen").textContent = d.gen ?? "—";
@@ -247,6 +266,13 @@ function render(d) {
   $("running").textContent = d.running_round ?? "—";
   $("event").textContent = d.last_event ?? "—";
   $("err").textContent = d.last_error ?? "";
+  const wd = d.withdrawal;
+  $("withdrawal").textContent = !wd ? "—"
+    : wd.state === "pending"
+      ? `待完成：第 ${wd.row} 行（一侧失联或重启后保持，可重试）`
+      : `已撤回第 ${wd.row} 行；训练从零开始，完成后才可下载新权重`;
+  $("wavail").textContent = d.weights_available ? "可下载"
+    : (wd ? "不可下载（撤回后须重训完成）" : "暂无已确认权重");
   workerBox("w1", d.workers && d.workers.worker1);
   workerBox("w2", d.workers && d.workers.worker2);
   drawChart(d.loss_history);
@@ -261,6 +287,13 @@ function render(d) {
   }
   const busy = st === "running" || st === "preparing";
   ["btnStart","btnResume"].forEach(b=>$(b).disabled = busy);
+  // Withdrawal controls: accepted only while paused/completed; a pending
+  // withdrawal offers an explicit retry of the same row.
+  const pending = wd && wd.state === "pending";
+  $("btnWithdraw").disabled = !(st === "paused" || st === "completed");
+  $("btnWithdrawRetry").style.display = pending ? "" : "none";
+  if (pending) $("wdRow").value = wd.row;
+  $("btnWeights").disabled = !d.weights_available;
 }
 
 function pushLog(line) {
@@ -286,6 +319,27 @@ $("btnReset").onclick = async()=>{
   if(!confirm("清除当前任务及其状态？")) return;
   try{ await post("/api/reset"); location.reload(); }
   catch(e){ pushLog("重置失败: "+e.message); } };
+async function doWithdraw(row) {
+  try {
+    const d = await post("/api/withdraw", {row});
+    $("withdrawErr").textContent = "";
+    if (d.status === "withdrawing")
+      pushLog(`撤回第 ${row} 行已受理但待完成：一侧不可达，可重试`);
+    else
+      pushLog(`撤回第 ${row} 行已完成：新任务 ${String(d.task_id).slice(0,8)}，训练从零开始`);
+  } catch(e) { $("withdrawErr").textContent = e.message; }
+  poll();
+}
+$("btnWithdraw").onclick = () => {
+  const row = parseInt($("wdRow").value, 10);
+  if (!(row >= 1)) { $("withdrawErr").textContent = "请输入有效数据行号（≥1）"; return; }
+  if (!confirm(`确认撤回第 ${row} 条数据记录？\n旧权重将立即失效且不可恢复，训练将从零开始。`)) return;
+  doWithdraw(row);
+};
+$("btnWithdrawRetry").onclick = () => {
+  const wd = lastStatus.withdrawal;
+  if (wd && wd.state === "pending") doWithdraw(wd.row);
+};
 $("btnWeights").onclick = ()=>{ window.location = "/api/weights"; };
 $("btnDelay").onclick = async()=>{
   const s = parseFloat($("delay").value)||0;

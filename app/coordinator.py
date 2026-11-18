@@ -36,7 +36,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import lrmath
-from storage import (atomic_write_json, exists,
+from storage import (atomic_write_json, delete_files, exists,
                      if_exists_read_json, read_json)
 
 DATA_DIR = os.environ.get("COORD_DATA", "/data")
@@ -95,6 +95,54 @@ def split_indices(n: int) -> Tuple[List[int], List[int]]:
     """Deterministic, mutually-exclusive contiguous shard assignment."""
     cut = (n + 1) // 2  # worker1 gets the extra row when n is odd
     return list(range(0, cut)), list(range(cut, n))
+
+
+def fresh_status_for_job(job: Dict[str, Any], status_str: str, event: str,
+                         withdrawal: Optional[Dict[str, Any]] = None
+                         ) -> Dict[str, Any]:
+    """Zero-initialised status document for a (possibly revised) job."""
+    x = np.asarray(job["x"], dtype=np.float64)
+    y = np.asarray(job["y"], dtype=np.float64)
+    zero = lrmath.to_list(lrmath.zero_buffers())
+    doc: Dict[str, Any] = {
+        "task_id": job["task_id"], "gen": 0,
+        "status": status_str, "confirmed_round": 0,
+        "total_rounds": int(job["rounds"]),
+        "w": zero, "v": zero,
+        "loss_history": [{"round": 0,
+                          "loss": lrmath.bce_loss(lrmath.augment(x), y, zero),
+                          "at": now_ms()}],
+        "running_round": None, "last_event": event,
+        "last_error": None, "created_at": now_ms(),
+    }
+    if withdrawal is not None:
+        doc["withdrawal"] = withdrawal
+    return doc
+
+
+def purge_weights() -> None:
+    """Irrevocably delete every published weight artifact.
+
+    Called the moment a record withdrawal is accepted: the old model must
+    become undownloadable at once and unrecoverable even after a restart.
+    """
+    delete_files(WEIGHTS_DIR,
+                 lambda name: name.startswith("weights_")
+                 and name.endswith(".json"))
+
+
+def weights_downloadable(st: Optional[Dict[str, Any]]) -> bool:
+    """Download gate: a withdrawal revokes the old model immediately, and a
+    revised task only publishes weights once retraining has completed."""
+    if not exists(LATEST_WEIGHTS):
+        return False
+    if st:
+        rec = st.get("withdrawal")
+        if rec and rec.get("state") == "pending":
+            return False
+        if rec and st.get("status") != "completed":
+            return False
+    return True
 
 
 # ============================================================ CSV validation
@@ -198,6 +246,35 @@ async def worker_health(worker_id: str) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - surfaced as status field
         CTX.worker_live[worker_id] = False
         return {"worker_id": worker_id, "alive": False, "error": str(exc)}
+
+
+# ============================================================ shard distribution
+def shard_rows(job: Dict[str, Any], worker_id: str) -> List[Dict[str, Any]]:
+    """This worker's mutually-exclusive slice of the job's dataset."""
+    return [{"x": [float(job["x"][i][0]), float(job["x"][i][1])],
+             "y": float(job["y"][i])} for i in job["shards"][worker_id]]
+
+
+async def push_shards(job: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Install the job's shards on both workers (best effort per worker)."""
+    return dict(zip(WORKERS, await asyncio.gather(*(
+        worker_call(wid, "/load",
+                    {"task_id": job["task_id"], "worker_id": wid,
+                     "rows": shard_rows(job, wid)}, tolerate=True)
+        for wid in WORKERS))))
+
+
+def shards_ok(job: Dict[str, Any], results: Dict[str, Dict[str, Any]]) -> bool:
+    """Both workers acknowledged the exact shard of the exact task."""
+    for wid in WORKERS:
+        res = results.get(wid, {})
+        if "_error" in res:
+            return False
+        if res.get("task_id") != job["task_id"]:
+            return False
+        if int(res.get("n", -1)) != len(job["shards"][wid]):
+            return False
+    return True
 
 
 # ============================================================ training loop
@@ -306,6 +383,11 @@ class DelayIn(BaseModel):
     seconds: float = Field(..., ge=0, le=120)
 
 
+class WithdrawIn(BaseModel):
+    # 1-based row number within the CSV's data rows (header excluded).
+    row: int = Field(..., ge=1)
+
+
 # ============================================================ application
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -313,6 +395,39 @@ async def lifespan(app: FastAPI):
     CTX.client = httpx.AsyncClient()
     CTX.job = if_exists_read_json(JOB_PATH)
     CTX.status = if_exists_read_json(STATUS_PATH)
+
+    # Crash between writing job.json and status.json (task creation or a
+    # record withdrawal): the durable job is authoritative. Rebuild a fresh
+    # zero-state status for it; a withdrawal additionally stays pending.
+    if CTX.job and (CTX.status is None
+                    or CTX.status.get("task_id") != CTX.job["task_id"]):
+        job = CTX.job
+        withdrawn = job.get("withdrawn_row")
+        if withdrawn is not None:
+            withdrawal = {"row": int(withdrawn), "state": "pending",
+                          "old_task_id": job.get("previous_task_id"),
+                          "new_task_id": job["task_id"],
+                          "requested_at": now_ms()}
+            save_status(fresh_status_for_job(
+                job, "withdrawing",
+                f"recovered after restart: withdrawal of record {withdrawn} "
+                f"is still pending", withdrawal))
+        else:
+            save_status(fresh_status_for_job(
+                job, "paused",
+                "recovered after restart during task creation; "
+                "reloading shards"))
+            try:
+                results = await push_shards(job)
+                if shards_ok(job, results):
+                    st = dict(CTX.status)
+                    st["status"] = "idle"
+                    st["last_event"] = ("shards reloaded after restart; "
+                                        "press Start")
+                    save_status(st)
+            except Exception:  # noqa: BLE001 - stays paused, user may reset
+                pass
+
     if CTX.status is not None and CTX.status["status"] == "running":
         # Coordinator died mid-round: nothing after the last confirmed round
         # may count. Mark paused; the next resume re-prepares both workers.
@@ -322,6 +437,21 @@ async def lifespan(app: FastAPI):
             "coordinator restarted while a round was in flight; "
             "unconfirmed round will be redone")
         save_status(CTX.status)
+
+    # A pending withdrawal survives restarts: the old model stays revoked
+    # (re-purge in case the crash happened before the deletion), and the
+    # shard redistribution is retried best-effort. If a worker is still
+    # down the withdrawal simply remains pending; the web page can retry
+    # the same row at any time without re-uploading the CSV.
+    if CTX.status and CTX.status.get("withdrawal", {}).get("state") == "pending":
+        purge_weights()
+        if CTX.status["status"] != "withdrawing":
+            CTX.status["status"] = "withdrawing"
+            save_status(CTX.status)
+        try:
+            await finalize_withdrawal_push()
+        except Exception:  # noqa: BLE001 - stays pending; page can retry
+            pass
     yield
     if CTX.task:
         CTX.task.cancel()
@@ -345,7 +475,8 @@ async def status() -> JSONResponse:
     if CTX.status:
         out.update(CTX.status)
     out["worker_live"] = CTX.worker_live
-    out["weights_available"] = exists(LATEST_WEIGHTS)
+    out["n_rows"] = int(CTX.job["n"]) if CTX.job else None
+    out["weights_available"] = weights_downloadable(CTX.status)
     return JSONResponse(out)
 
 
@@ -362,14 +493,6 @@ async def create_job(file: UploadFile = File(...),
     idx1, idx2 = split_indices(n)
 
     task_id = uuid.uuid4().hex
-    rows_all = [{"x": [float(x[i, 0]), float(x[i, 1])], "y": float(y[i])}
-                for i in range(n)]
-    shards = {
-        "worker1": [{"x": r["x"], "y": r["y"]}
-                    for r in (rows_all[i] for i in idx1)],
-        "worker2": [{"x": r["x"], "y": r["y"]}
-                    for r in (rows_all[i] for i in idx2)],
-    }
     job = {
         "task_id": task_id, "rounds": int(rounds), "n": n,
         "x": [[float(a), float(b)] for a, b in x],
@@ -382,35 +505,22 @@ async def create_job(file: UploadFile = File(...),
     # Durable first, before touching any worker.
     atomic_write_json(JOB_PATH, job)
     CTX.job = job  # keep in-memory context in sync with the durable file
-    zero = lrmath.to_list(lrmath.zero_buffers())
-    status_doc = {
-        "task_id": task_id, "gen": 0,
-        "status": "idle", "confirmed_round": 0,
-        "total_rounds": int(rounds),
-        "w": zero, "v": zero,
-        "loss_history": [{"round": 0,
-                          "loss": lrmath.bce_loss(lrmath.augment(x), y, zero),
-                          "at": now_ms()}],
-        "running_round": None, "last_event": "task created",
-        "last_error": None, "created_at": now_ms(),
-    }
+    status_doc = fresh_status_for_job(job, "idle", "task created")
     save_status(status_doc)
+    zero = status_doc["w"]
     write_weights_artifact(0, zero, zero, status_doc["loss_history"][0]["loss"])
 
     # Push the mutually-exclusive shards to the two independent processes.
-    results = await asyncio.gather(*(
-        worker_call(wid, "/load",
-                    {"task_id": task_id, "worker_id": wid,
-                     "rows": shards[wid]}, tolerate=True)
-        for wid in WORKERS))
-    for wid, res in zip(WORKERS, results):
-        if "_error" in res:
-            st = dict(CTX.status)
-            st["status"] = "paused"
-            st["last_error"] = f"shard load to {wid} failed: {res['_error']}"
-            st["last_event"] = "task created but a worker is unreachable"
-            save_status(st)
-            return JSONResponse(st, status_code=202)
+    results = await push_shards(job)
+    if not shards_ok(job, results):
+        st = dict(CTX.status)
+        st["status"] = "paused"
+        errs = {w: r.get("_error") for w, r in results.items()
+                if "_error" in r}
+        st["last_error"] = f"shard load failed: {errs}"
+        st["last_event"] = "task created but a worker is unreachable"
+        save_status(st)
+        return JSONResponse(st, status_code=202)
     st = dict(CTX.status)
     st["last_event"] = "shards loaded on both workers; press Start"
     save_status(st)
@@ -475,14 +585,138 @@ async def pause() -> JSONResponse:
     return JSONResponse(st)
 
 
+# ============================================================ record withdrawal
+async def finalize_withdrawal_push() -> JSONResponse:
+    """(Re)distribute the revised shards and, only when BOTH workers hold the
+    revised shard of the new task, mark the withdrawal applied.
+
+    Safe to call repeatedly (accept, web-page retry, restart recovery): the
+    durable status never leaves ``withdrawing`` until both sides acknowledge,
+    so a dead worker or a coordinator restart simply keeps it pending.
+    """
+    job, st = require_job()
+    results = await push_shards(job)
+    st = dict(CTX.status)
+    if shards_ok(job, results):
+        rec = dict(st["withdrawal"])
+        rec["state"] = "applied"
+        rec["applied_at"] = now_ms()
+        st["status"] = "idle"
+        st["withdrawal"] = rec
+        st["last_error"] = None
+        st["last_event"] = (f"record {rec['row']} withdrawn; revised shards "
+                            f"loaded on both workers; training restarts from "
+                            f"zero (weights download unlocks at completion)")
+        save_status(st)
+        return JSONResponse(st)
+    st["status"] = "withdrawing"
+    errs = {w: r.get("_error") for w, r in results.items() if "_error" in r}
+    st["last_error"] = (f"withdrawal pending, a worker is unreachable: {errs}")
+    st["last_event"] = ("withdrawal stays pending; old weights remain revoked; "
+                        "retry the same row to continue")
+    save_status(st)
+    return JSONResponse(st, status_code=202)
+
+
+@app.post("/api/withdraw")
+async def withdraw(body: WithdrawIn) -> JSONResponse:
+    """Withdraw one voided record (by original CSV data-row number, 1-based).
+
+    Accepted only while the task is paused or completed. Acceptance is a
+    one-way door: the old weights are revoked immediately and irrevocably,
+    the revised dataset is re-sharded to both workers under a NEW task id
+    (old-generation traffic is fenced), and training restarts from zero.
+    """
+    job, st = require_job()
+    if st["status"] in ("running", "preparing"):
+        raise HTTPException(409, "pause or finish training before withdrawing "
+                                 "a record")
+    # Make sure no training loop is still settling before mutating state.
+    if CTX.task and not CTX.task.done():
+        CTX.task.cancel()
+        await asyncio.gather(CTX.task, return_exceptions=True)
+    CTX.task = None
+
+    row = int(body.row)
+    rec = st.get("withdrawal")
+    if rec and rec.get("state") == "pending":
+        if int(rec["row"]) != row:
+            raise HTTPException(409, f"withdrawal of record {rec['row']} is "
+                                     f"already pending; retry that row or "
+                                     f"reset the task")
+        # Idempotent retry of the same withdrawal: the revised job is already
+        # durable, only the shard redistribution needs to finish. No CSV
+        # re-upload is needed - the data lives in job.json.
+        return await finalize_withdrawal_push()
+    if (rec and rec.get("state") == "applied"
+            and int(rec.get("row", -1)) == row
+            and st["status"] == "idle" and st["confirmed_round"] == 0):
+        # Same withdrawal already fully applied; a duplicate retry is a no-op.
+        return JSONResponse(st)
+    if st["status"] not in ("paused", "completed"):
+        raise HTTPException(409, f"cannot withdraw from status "
+                                 f"'{st['status']}'; pause or complete first")
+
+    n = int(job["n"])
+    if row > n:
+        raise HTTPException(400, f"row must be in [1,{n}] (data rows of the "
+                                 f"current dataset)")
+    # Validate the revised dataset BEFORE changing any state: withdrawing
+    # must leave at least two rows and both label classes, otherwise the
+    # request is rejected and the original task stays fully usable.
+    keep = [i for i in range(n) if i != row - 1]
+    kept_labels = {float(job["y"][i]) for i in keep}
+    if len(keep) < MIN_ROWS:
+        raise HTTPException(400, "withdrawal would leave fewer than 2 data "
+                                 "rows; rejected, task unchanged")
+    if len(kept_labels) < 2:
+        raise HTTPException(400, "withdrawal would leave a single label "
+                                 "class; rejected, task unchanged")
+
+    # Build the revised job under a new task id. The new id is what fences
+    # off every in-flight or late message of the old training group.
+    new_task_id = uuid.uuid4().hex
+    idx1, idx2 = split_indices(len(keep))
+    revised = {
+        "task_id": new_task_id, "rounds": int(job["rounds"]), "n": len(keep),
+        "x": [job["x"][i] for i in keep],
+        "y": [job["y"][i] for i in keep],
+        "shards": {"worker1": idx1, "worker2": idx2},
+        "created_at": now_ms(),
+        "hyper": job.get("hyper", {"lr": lrmath.LEARNING_RATE,
+                                   "momentum": lrmath.MOMENTUM}),
+        "withdrawn_row": row,
+        "previous_task_id": job["task_id"],
+    }
+    withdrawal = {"row": row, "state": "pending",
+                  "old_task_id": job["task_id"], "new_task_id": new_task_id,
+                  "requested_at": now_ms()}
+    # Durable order: revised job, then the pending-withdrawal status, then the
+    # weight revocation. A crash anywhere is recovered at startup (lifespan
+    # reconciles a job/status task-id mismatch and re-purges the artifacts).
+    atomic_write_json(JOB_PATH, revised)
+    CTX.job = revised
+    save_status(fresh_status_for_job(
+        revised, "withdrawing",
+        f"record {row} withdrawn; redistributing revised shards",
+        withdrawal))
+    purge_weights()  # old model is now undownloadable and unrecoverable
+    return await finalize_withdrawal_push()
+
+
 @app.post("/api/reset")
 async def reset() -> JSONResponse:
     ensure_not_busy()
+    if CTX.task and not CTX.task.done():
+        CTX.task.cancel()
+        await asyncio.gather(CTX.task, return_exceptions=True)
+    CTX.task = None
     for p in (JOB_PATH, STATUS_PATH):
         try:
             os.unlink(p)
         except FileNotFoundError:
             pass
+    purge_weights()  # a cleared task must not keep serving old artifacts
     CTX.job = None
     CTX.status = None
     return JSONResponse({"ok": True, "event": "task cleared"})
@@ -520,6 +754,14 @@ async def kill_worker(worker_id: str) -> JSONResponse:
 
 @app.get("/api/weights")
 async def download_weights() -> FileResponse:
+    st = CTX.status
+    rec = st.get("withdrawal") if st else None
+    if rec and rec.get("state") == "pending":
+        raise HTTPException(409, f"weights revoked: withdrawal of record "
+                                 f"{rec.get('row')} is still pending")
+    if rec and st["status"] != "completed":
+        raise HTTPException(409, "record withdrawn: weights become "
+                                 "downloadable once retraining completes")
     if not exists(LATEST_WEIGHTS):
         raise HTTPException(404, "no confirmed weights yet")
     doc = read_json(LATEST_WEIGHTS)
